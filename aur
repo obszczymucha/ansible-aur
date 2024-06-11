@@ -1,0 +1,197 @@
+#!/usr/bin/python
+
+from ansible.module_utils.basic import AnsibleModule
+import os
+import subprocess
+import re
+from datetime import datetime
+
+LOG_FILE = "/var/log/ansible-aur.log"
+
+
+def log_message(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(LOG_FILE, "a") as log_file:
+            log_file.write(f"{timestamp} - {message}\n")
+    except Exception as e:
+        print(f"Failed to write log: {e}")
+
+
+def run_command(module, command, cwd=None):
+    log_message(f"Running command: {command} in {cwd if cwd else 'current directory'}")
+    result = subprocess.run(
+        command, shell=True, cwd=cwd, text=True, capture_output=True
+    )
+    if result.returncode != 0:
+        log_message(
+            f"Command failed: {command}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        module.fail_json(
+            msg=f"Command failed: {command}", stderr=result.stderr, stdout=result.stdout
+        )
+    log_message(f"Command output: {result.stdout.strip()}")
+    return result.stdout.strip()
+
+
+def parse_dependencies(module, pkgbuild_path):
+    with open(pkgbuild_path, "r") as file:
+        content = file.read()
+
+    makedepends = re.findall(r"^makedepends=\(([^)]+)\)", content, re.MULTILINE)
+    depends = re.findall(r"^depends=\(([^)]+)\)", content, re.MULTILINE)
+
+    def extract_packages(dependency_string):
+        return [
+            pkg.strip().strip("'")
+            for pkg in re.split(r"\s+", dependency_string.strip())
+            if pkg
+        ]
+
+    makedepends_list = []
+    if makedepends:
+        makedepends_list = extract_packages(makedepends[0])
+
+    depends_list = []
+    if depends:
+        depends_list = extract_packages(depends[0])
+
+    all_dependencies = list(set(makedepends_list + depends_list))  # Remove duplicates
+    log_message(f"Parsed makedepends: {makedepends_list}")
+    log_message(f"Parsed depends: {depends_list}")
+    return all_dependencies
+
+
+def is_package_installed(package_name) -> bool:
+    log_message(f"Checking if {package_name} is installed")
+
+    result = subprocess.run(
+        f"pacman -Qi {package_name}", shell=True, text=True, capture_output=True
+    )
+
+    return result.returncode == 0
+
+
+def install_dependencies(module, dependencies, username, dest_root):
+    missing_dependencies = []
+    for dep in dependencies:
+        package_name = dep.split(">=")[0]
+
+        if not is_package_installed(package_name):
+            log_message(f"{package_name} is not installed")
+            result = subprocess.run(
+                f"pacman -Ss {package_name}", shell=True, text=True, capture_output=True
+            )
+            if package_name not in result.stdout:
+                log_message(f"{package_name} not found in pacman database")
+                missing_dependencies.append(dep)
+            else:
+                log_message(f"Installing {package_name} from pacman")
+                run_command(module, f"pacman -S --noconfirm {package_name}")
+        else:
+            log_message(f"{package_name} is already installed")
+
+    for missing_dep in missing_dependencies:
+        log_message(f"Installing missing dependency {missing_dep} from AUR")
+        dependency_name = missing_dep.split(">=")[0]
+        dependency_path = os.path.join(dest_root, dependency_name)
+
+        if not os.path.exists(dependency_path):
+            run_command(
+                module,
+                f"sudo -u {username} git clone https://aur.archlinux.org/{dependency_name}.git {dependency_path}",
+            )
+
+        # Recursively handle the dependencies of the missing dependency
+        handle_dependencies(module, dependency_name, dependency_path, username)
+
+
+def handle_dependencies(module, name, dest, username):
+    pkgbuild_path = os.path.join(dest, "PKGBUILD")
+    if os.path.exists(pkgbuild_path):
+        log_message(f"Parsing dependencies from {pkgbuild_path}")
+        dependencies = parse_dependencies(module, pkgbuild_path)
+        log_message(f"Dependencies found: {dependencies}")
+        install_dependencies(module, dependencies, username, os.path.dirname(dest))
+
+    build_and_install(module, dest, username)
+
+
+def build_and_install(module, dest, username):
+    log_message(f"Building and installing package in {dest}")
+    log_message("Cleaning up...")
+
+    run_command(module, "rm -rf pkg src *.zst", cwd=dest)
+    run_command(module, f"sudo -u {username} makepkg", cwd=dest)
+
+    package = run_command(
+        module,
+        "ls | grep -E '.*\\.pkg\\.tar\\.zst' | grep -v debug | head -n 1",
+        cwd=dest,
+    )
+    msg = f"New version: {package}"
+
+    run_command(module, f"pacman -U --noconfirm {package}", cwd=dest)
+
+    return msg
+
+
+def is_repository_up_to_date(module, dest, username) -> bool:
+    log_message(f"Fetching updates for repository in {dest}")
+
+    run_command(module, f"sudo -u {username} git -C {dest} reset --hard")
+    run_command(module, f"sudo -u {username} git -C {dest} clean -fd")
+    run_command(module, f"sudo -u {username} git -C {dest} fetch")
+    result = run_command(
+        module, f"sudo -u {username} git -C {dest} diff --name-only origin/master"
+    )
+
+    return not result
+
+
+def main():
+    module_args = dict(
+        name=dict(type="str", required=True),
+        dest=dict(type="str", required=True),
+        username=dict(type="str", required=True),
+    )
+
+    module = AnsibleModule(argument_spec=module_args, supports_check_mode=True)
+
+    name = module.params["name"]
+    dest_root = module.params["dest"]
+    dest = f"{dest_root}/{name}"
+    username = module.params["username"]
+
+    result = dict(changed=False, msg="")
+
+    if not os.path.exists(dest):
+        repo_url = f"https://aur.archlinux.org/{name}.git"
+        log_message(f"Cloning repository {repo_url} to {dest}")
+        run_command(module, f"sudo -u {username} git clone {repo_url} {dest}")
+        result["changed"] = True
+        result["msg"] = "Repository cloned. "
+
+        handle_dependencies(module, name, dest, username)
+    else:
+        if not is_repository_up_to_date(module, dest, username):
+            log_message(f"Pulling updates for repository in {dest}")
+            run_command(module, f"sudo -u {username} git -C {dest} pull")
+            result["changed"] = True
+            result["msg"] = "Repository updated. "
+
+            handle_dependencies(module, name, dest, username)
+        else:
+            result["msg"] = "Repository is already up to date. "
+
+            if not is_package_installed(name):
+                handle_dependencies(module, name, dest, username)
+
+                result["changed"] = True
+                result["msg"] += "Package installed. "
+
+    module.exit_json(**result)
+
+
+if __name__ == "__main__":
+    main()
